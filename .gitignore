@@ -30,3 +30,12 @@
 *.exe
 *.out
 *.app
+
+# Visual Studio auto-generated folder
+.vs/
+
+# Release folder
+NFSMWSlingshotFeature/Release/
+
+# Others
+ARCHIVE/
