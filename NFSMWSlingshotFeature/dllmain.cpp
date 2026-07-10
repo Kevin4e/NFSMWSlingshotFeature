@@ -1,341 +1,311 @@
 ﻿#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 
-#include <windows.h>
-#include <cstdint>
-#include <cmath>
+#define K4MP_NO_MUTEX
+#define K4MP_ENABLE_CORE
+#define K4MP_ENABLE_BASIC_ASM
+
+#include <Windows.h>
 #include <vector>
-#include <thread>
 #include <limits>
+#include <string>
 
-#include "../includes/K4MemPatcher.hpp"
+#include "../includes/K4MemPatcher/K4MemPatcher.hpp"
 #include "../includes/K4IniReader.hpp"
+#include "../includes/NFSVersionManager.hpp"
 
-#include "settings.h"
+#include "settings.hpp"
+#include "addresses.hpp"
+#include "utils.hpp"
+#include "vehicles.hpp"
 
-// AI
-//constexpr int maxAIOpenWorld = 100;
-constexpr DWORD tableStart = 0x009383B0;
-//constexpr DWORD tableEnd = tableStart + (4 * maxAIOpenWorld);
+using enum NFSVersionManager::GameKey;
 
-// Coordinates offsets
-constexpr uint8_t xCoordPositionOffset = 0x10;
-constexpr uint8_t yCoordPositionOffset = 0x14;
-constexpr uint8_t zCoordPositionOffset = 0x18;
+// Constants
+constexpr float maxDraftGainRate{ 0.003f };
+constexpr float draftDecayRate{ 0.005f };
+constexpr float infinity{ std::numeric_limits<float>::infinity() };
+constexpr float minVehicleSpeed{ 1.0f };
+constexpr FloatBounds slingshotForceRange{ 0.04f, 0.07f };
+constexpr float AISpeedWeight{ 0.7f };
+constexpr float playerSpeedWeight{ 0.3f };
 
-// Velocity offsets
-constexpr uint8_t xVelocityOffset = 0x20;
-constexpr uint8_t yVelocityOffset = 0x24;
-constexpr uint8_t zVelocityOffset = 0x28;
+// Global variables
+float MinimumSpeedForMaxDraftGain{};
+bool speedDependency{};
+float MaxLateralDistance{};
+float MaxVerticalDistance{};
+bool autoLateral{};
+bool autoVertical{};
+float slingshotBoost{};
 
-// Player
-constexpr DWORD playerVehicleBase = 0x009386C8;
+K4MemPatcher::StablePtr ptrToSpeedbreaker{ { 0x589228, 0x84 }, true };
 
-constexpr DWORD playerVehicleXCoordPosition = playerVehicleBase + xCoordPositionOffset;
-constexpr DWORD playerVehicleYCoordPosition = playerVehicleBase + yCoordPositionOffset;
-constexpr DWORD playerVehicleZCoordPosition = playerVehicleBase + zCoordPositionOffset;
+std::vector<VehicleInfo> activeAIVehicles{};
 
-constexpr DWORD playerVehicleXAxisSpeed = playerVehicleBase + xVelocityOffset;
-constexpr DWORD playerVehicleYAxisSpeed = playerVehicleBase + yVelocityOffset;
-constexpr DWORD playerVehicleZAxisSpeed = playerVehicleBase + zVelocityOffset;
+/*
+ *  Drafting system update routine.
+ *
+ *  This function is injected into the game's execution flow via a CALL hook and is executed repeatedly during gameplay.
+ *
+ *  Responsibilities:
+ *  - Reads player vehicle position, velocity, and speed from memory.
+ *  - Iterates through the game's vehicle table to find active AI vehicles.
+ *  - Attempts to filter out non-vehicle objects and stationary entries.
+ *  - Determines whether an AI vehicle is ahead of the player and within the configured longitudinal and lateral drafting ranges.
+ *  - Calculates drafting accumulation based on proximity to the closest valid AI vehicle.
+ *  - Applies a forward velocity boost ("slingshot") along the player's movement direction.
+ *  - Gradually decays the stored boost when the player is not drafting.
+ *  - Optionally uses the speedbreaker bar as a visual indicator of the accumulated boost.
+ *
+ *  The function exits early when:
+ *  - The player is not in open world mode.
+ *  - The player's speed is too low.
+ *  - The game is paused.
+ *  - No vehicle was found.
+ */
 
-constexpr DWORD playerVehicleSpeedAddress = 0x009142C8; // Game units
+void DraftingSystemHook() {
+	const bool openWorldFlag{ K4MemPatcher::readMemory<bool>(Game::Flags::OpenWorld, false) };
 
-// Others
-constexpr DWORD openWorldFlagAddress = 0x0092D884;
-constexpr DWORD pauseMenuFlagAddress = 0x0091CAE4;
-constexpr DWORD numberOfAISpawnedAddress = 0x0092CDE4;
+	if (!openWorldFlag)
+		return; // Not in open world
 
-constexpr float minSpeedToClassifyAsVehicle = 1.0f;
+	const VehicleInfo playerVehicle{ getPlayerVehicle() };
 
-constexpr DWORD delayTimeMs = 10;
+	const float playerSpeed{ playerVehicle.currentSpeed };
 
-struct Vec3 {
-    float x;
-    float y;
-    float z;
+	if (playerSpeed < minVehicleSpeed) { // Car almost still
+		const auto resolvedPtr{ ptrToSpeedbreaker.Resolve() };
 
-    Vec3(float x_, float y_, float z_) : x(x_), y(y_), z(z_) {}
-};
+		if (UseSpeedbreakerBarAsSlingshotMeter && K4MemPatcher::readMemory<float>(resolvedPtr, false) != 0.0f)
+			K4MemPatcher::writeMemory<float>(resolvedPtr, 0.0f, false, false); // Set speedbreaker bar to 0 only if it's not 0
 
-// Takes a value from one numerical range and converts it to the equivalent value in another range
-constexpr inline float map(double r1_1, float r1_2, float r2_1, float r2_2, float val) noexcept {
-    float perc = (val - r1_1) / (r1_2 - r1_1);
-    return (r2_2 - r2_1) * perc + r2_1;
+		slingshotBoost = 0.0f;
+
+		return;
+	}
+
+	const bool pauseMenuFlag{ K4MemPatcher::readMemory<bool>(Game::Flags::PauseMenu, false) };
+
+	if (pauseMenuFlag)
+		return; // In pause menu
+
+	if (UseSpeedbreakerBarAsSlingshotMeter)
+		K4MemPatcher::writeMemory<float>(ptrToSpeedbreaker.Resolve(), slingshotBoost, false, false);
+
+	getActiveAIVehicles(activeAIVehicles);
+
+	if (activeAIVehicles.empty())
+		return;
+
+	const Size3 playerHalfDim{ playerVehicle.dim * 0.5f };
+
+	const Vec3 playerVelocities
+	{
+		K4MemPatcher::readMemory<float>(Player::Velocity::X, false),
+		K4MemPatcher::readMemory<float>(Player::Velocity::Y, false),
+		K4MemPatcher::readMemory<float>(Player::Velocity::Z, false)
+	};
+
+	const Vec3 playerNormVelocities{ playerVelocities / playerSpeed };
+
+	float minDistance{ infinity };
+	float AISpeed{};
+
+	for (const auto& AIVehicle : activeAIVehicles) {
+		const float AICurrentSpeed{ AIVehicle.currentSpeed };
+
+		if (AICurrentSpeed < minVehicleSpeed)
+			continue; // AI Vehicle is not moving
+
+		// Get the relative distances from player to AI in longitudinal, lateral, and vertical axes
+		const Vec3 relativePos{ playerVehicle.relativePositionTo(AIVehicle) };
+
+		const float longitudinalDistance{ relativePos.x };
+		const float lateralDistance{ absolute(relativePos.y) };
+		const float verticalDistance{ absolute(relativePos.z) };
+
+		// Skip if AI is behind or too far
+		if (longitudinalDistance < 0.0f || longitudinalDistance > MaxLongitudinalDistance)
+			continue;
+
+		const Size3& AIDim{ AIVehicle.dim };
+
+		const float lateralDistanceToCompare = autoLateral ?
+			AIDim.width + playerHalfDim.width : // AI and player lateral size
+			MaxLateralDistance; // From .ini
+
+		const float verticalDistanceToCompare = autoVertical ?
+			AIDim.depth + playerHalfDim.depth : // AI and player lateral size
+			MaxVerticalDistance; // From .ini
+
+		// Check lateral and vertical bounds
+		if (lateralDistance > lateralDistanceToCompare || verticalDistance > verticalDistanceToCompare)
+			continue;
+
+		// Keep the nearest AI vehicle
+		if (longitudinalDistance < minDistance) {
+			minDistance = longitudinalDistance;
+			AISpeed = AICurrentSpeed;
+		}
+	}
+
+	const bool isDrafting{ minDistance != infinity };
+
+	if (isDrafting) { // Nearest AI found within lateral and longitudinal range
+
+		// The closer and the faster (if speed dependency is enabled) it is, the faster the boost grows
+
+		const float boostFromDistance{ mapUnclamped(
+			{ 0.0f, MaxLongitudinalDistance },
+			{ maxDraftGainRate, 0.0f },
+			minDistance
+		) };
+
+		float normalizedGain{};
+
+		if (speedDependency) {
+			const float boostFromAISpeed{ mapClamped(
+				{ 0.0f, MinimumSpeedForMaxDraftGain },
+				{ 0.0f, maxDraftGainRate },
+				AISpeed
+			) };
+
+			const float boostFromPlayerSpeed{ mapClamped(
+				{ 0.0f, MinimumSpeedForMaxDraftGain },
+				{ 0.0f, maxDraftGainRate },
+				playerSpeed
+			) };
+
+			const float combinedGain{
+				boostFromDistance +
+				boostFromAISpeed * AISpeedWeight +
+				boostFromPlayerSpeed * playerSpeedWeight
+			};
+
+			normalizedGain = combinedGain * 0.5f;
+		}
+		else
+			normalizedGain = boostFromDistance;
+
+		slingshotBoost += normalizedGain * ProgressiveBoostMultiplier;
+	}
+	else
+		slingshotBoost -= draftDecayRate * DecayBoostMultiplier; // Gradually decrease the boost
+
+	clamp(slingshotBoost, { 0.0f, MaxSlingshotBoost }); // Make sure the boost doesn't exceed its bounds
+
+	// Apply the boost correctly along the direction vector
+	if (slingshotBoost > 0.0f) {
+		if (SlingshotMode != 0 || !isDrafting) { // If post-drafting is chosen, apply boost only after drafting
+
+			/*
+			 *  Close to 0.0 -> TOO WEAK
+			 *  Higher than 0.1 -> TOO STRONG
+			 *  Mapping the slingshot boost accumulated to [0.04, 0.07] is a balanced range
+			 */
+			const float actualBoost{ mapUnclamped({ 0.0f, MaxSlingshotBoost }, slingshotForceRange, slingshotBoost) };
+
+			const float boostX{ (playerNormVelocities.x * actualBoost) * FinalBoostMultiplier };
+			const float boostY{ (playerNormVelocities.y * actualBoost) * FinalBoostMultiplier };
+			const float boostZ{ (playerNormVelocities.z * actualBoost) * FinalBoostMultiplier };
+
+			K4MemPatcher::writeMemory<float>(Player::Velocity::X, playerVelocities.x + boostX, false, false);
+			K4MemPatcher::writeMemory<float>(Player::Velocity::Y, playerVelocities.y + boostY, false, false);
+			K4MemPatcher::writeMemory<float>(Player::Velocity::Z, playerVelocities.z + boostZ, false, false);
+		}
+	}
 }
 
-// Calculates the magnitude (length) of a 3D vector given its vector components
-inline float getMagnitude(float v1, float v2, float v3) noexcept {
-    return std::sqrt(v1 * v1 + v2 * v2 + v3 * v3);
-}
-
-void DraftingSystemThread() {
-    const float MaxLongitudinalDistanceSquared = MaxLongitudinalDistance * MaxLongitudinalDistance;
-    const float MaxLateralDistanceSquared = MaxLateralDistance * MaxLateralDistance;
-
-    float slingshotBoost{};
-    bool isDrafting{};
-
-    DWORD ptrToSpeedbreaker{};
-
-    std::vector<Vec3>activeAIVehiclesPos;
-    activeAIVehiclesPos.reserve(100);
-
-    while (true) {
-        const bool openWorldFlag = K4MemPatcher::readMemory<bool>(openWorldFlagAddress);
-        const bool pauseMenuFlag = K4MemPatcher::readMemory<bool>(pauseMenuFlagAddress);
-        const float currentSpeed = K4MemPatcher::readMemory<float>(playerVehicleSpeedAddress);
-        bool skip = !openWorldFlag || pauseMenuFlag;
-
-        if (!openWorldFlag) {
-            // Skip
-            Sleep(delayTimeMs);
-            continue;
-        }
-
-        if (UseSpeedbreakerBarAsSlingshotMeter)
-            ptrToSpeedbreaker = K4MemPatcher::readMemory<DWORD>(0x989228) + 0x84;
-
-        if (currentSpeed < 1.0f) { // If not in open world or car almost still
-            slingshotBoost = 0.0f;
-
-            if (UseSpeedbreakerBarAsSlingshotMeter)
-                K4MemPatcher::writeMemory<float>(ptrToSpeedbreaker, 0.0f);
-
-            skip = true;
-        }
-        if (skip || pauseMenuFlag) { // Skip if reset was required or in pause menu
-            // Skip
-            Sleep(delayTimeMs);
-            continue;
-        }
-
-        if (UseSpeedbreakerBarAsSlingshotMeter)
-            K4MemPatcher::writeMemory<float>(ptrToSpeedbreaker, slingshotBoost);
-
-        //MessageBoxA(nullptr, "we can get that boost", "debug", NULL);
-
-        activeAIVehiclesPos.clear(); // Make sure to clear the vector before filling it
-
-        DWORD tableEnd = tableStart + (4 * K4MemPatcher::readMemory<uint32_t>(numberOfAISpawnedAddress));
-
-        // Get active AI vehicles' positions (except the ones not moving)
-        for (DWORD table = tableStart; table <= tableEnd; table += 4) {
-
-            const DWORD vehicleBase = K4MemPatcher::readMemory<DWORD>(table);
-
-            if (!vehicleBase || vehicleBase == playerVehicleBase)
-                continue; // Skip if vehicle base is null or it's the player's
-
-            const float AIVehicleXCoord = K4MemPatcher::readMemory<float>(vehicleBase + xCoordPositionOffset);
-            const float AIVehicleYCoord = K4MemPatcher::readMemory<float>(vehicleBase + yCoordPositionOffset);
-            const float AIVehicleZCoord = K4MemPatcher::readMemory<float>(vehicleBase + zCoordPositionOffset);
-
-            const float AIVehicleXVel = K4MemPatcher::readMemory<float>(vehicleBase + xVelocityOffset);
-            const float AIVehicleYVel = K4MemPatcher::readMemory<float>(vehicleBase + yVelocityOffset);
-            const float AIVehicleZVel = K4MemPatcher::readMemory<float>(vehicleBase + zVelocityOffset);
-
-            /*
-             *  NOTE ON AI FILTERING:
-             *
-             *  The game doesn't have a reliable address for the number of active AI vehicles (at least none found during my research)
-             *
-             *  'numberOfAISpawnedAddress' cannot be trusted:
-             *  The game's table starting at 0x9383B0 lists AI cars and world objects in random order,
-             *  and it's only possible to know how many AI cars have spawned during the open world session (it never decreases).
-             *  So it's easy to miss the last vehicles generated (which are at the end of the table)
-             *
-             *  The current way to skip non-AI entries is checking the coordinates and velocities, but it's not enough (e.g. a crashed traffic light can have a velocity)
-             *
-             *  If someone discovers a reliable method to filter AI cars from the world objects, contributions are welcome.
-             */
-            if
-            (
-                (std::fabs(AIVehicleXCoord) < 1e-3 && std::fabs(AIVehicleYCoord) < 1e-3 && std::fabs(AIVehicleZCoord) < 1e-3) ||
-                (std::fabs(AIVehicleXVel) < minSpeedToClassifyAsVehicle && std::fabs(AIVehicleYVel) < minSpeedToClassifyAsVehicle && std::fabs(AIVehicleZVel) < minSpeedToClassifyAsVehicle)
-            )
-            {
-                tableEnd += 4;
-                continue; // Skip this entry if coordinates or velocities are close to 0
-            }
-
-            activeAIVehiclesPos.emplace_back
-            (
-                AIVehicleXCoord,
-                AIVehicleYCoord,
-                AIVehicleZCoord
-            );
-        }
-
-        const float coordX = K4MemPatcher::readMemory<float>(playerVehicleXCoordPosition);
-        const float coordY = K4MemPatcher::readMemory<float>(playerVehicleYCoordPosition);
-        const float coordZ = K4MemPatcher::readMemory<float>(playerVehicleZCoordPosition);
-
-        const float velX = K4MemPatcher::readMemory<float>(playerVehicleXAxisSpeed);
-        const float velY = K4MemPatcher::readMemory<float>(playerVehicleYAxisSpeed);
-        const float velZ = K4MemPatcher::readMemory<float>(playerVehicleZAxisSpeed);
-
-        const float normVelX = velX / currentSpeed;
-        const float normVelY = velY / currentSpeed;
-        const float normVelZ = velZ / currentSpeed;
-
-        float minDistance = std::numeric_limits<float>::max();
-
-        for (const auto& aiPos : activeAIVehiclesPos) {
-            Vec3 playerToAI
-            (
-                aiPos.x - coordX,
-                aiPos.y - coordY,
-                aiPos.z - coordZ
-            );
-
-            // Calculate the dot Product to check if AI is ahead
-            const float dot = playerToAI.x * normVelX + playerToAI.y * normVelY + playerToAI.z * normVelZ;
-
-            if (dot < 0 || dot > MaxLongitudinalDistance)
-                continue; // Skip if AI is behind the player or it's too far
-
-            /*
-             *  NOTE ON TOTAL DISTANCE:
-             *
-             *  The total distance is measured from the vehicle's center point, not from its rear.
-             *  Therefore, the player's vehicle must be very close to vehicles with trailers
-             */
-             // Calculate the total distance
-            const float totalDistance = getMagnitude(playerToAI.x, playerToAI.y, playerToAI.z);
-
-            // Get the longitudinal distance
-            const float longitudinalDistance = dot;
-
-            // Calculate the lateral distance (using the Pythagorean theorem)
-            const float lateralDistanceSquared = totalDistance * totalDistance - longitudinalDistance * longitudinalDistance;
-
-            /*
-            // Get the depth distance
-            const float depthDistance = std::fabs(playerToAI.y);
-            */
-
-            // Apply both checks
-            if (longitudinalDistance <= MaxLongitudinalDistanceSquared && lateralDistanceSquared <= MaxLateralDistanceSquared) {
-                if (totalDistance < minDistance)
-                    minDistance = totalDistance;
-            }
-        }
-
-        const bool isMinimumDistanceValid = minDistance != std::numeric_limits<float>::max();
-
-        if (isMinimumDistanceValid) { // Nearest AI found within lateral and longitudinal range
-            isDrafting = true;
-
-            if (slingshotBoost < MaxSlingshotBoost) {
-                // The closer it is, the faster the boost grows
-                slingshotBoost += map(0, MaxLongitudinalDistance, 0.002f, 0, minDistance) * ProgressiveBoostMultiplier;
-
-                if (slingshotBoost > MaxSlingshotBoost) slingshotBoost = MaxSlingshotBoost; // Set to maximum boost if it goes beyond
-            }
-            else
-                slingshotBoost = MaxSlingshotBoost; // Cap the boost
-        }
-        else {
-            isDrafting = false;
-
-            if (slingshotBoost > 0.0f) {
-                slingshotBoost -= 0.0025f; // Gradually decrease the boost
-
-                if (slingshotBoost < 0.0f) slingshotBoost = 0.0f; // Reset to 0 if it goes below
-            }
-            else
-                slingshotBoost = 0.0f; // Cap the boost
-        }
-
-        // Apply the boost correctly along the direction vector
-        if (slingshotBoost > 0.0f) {
-            if (SlingshotMode != 0 || !isDrafting) { // If post-drafting is chosen, apply boost only after drafting
-
-                /*
-                 *  Close to 0.0 -> TOO WEAK
-                 *  Close to 1.0 -> TOO STRONG
-                 *  Mapping the slingshot boost accumulated to [0.25, 0.55] is a balanced range
-                 */
-                const float actualBoost = map(0.0f, MaxSlingshotBoost, 0.25f, 0.55f, slingshotBoost);
-
-                const float boostX = ((normVelX * actualBoost) / 17.0f) * FinalBoostMultiplier;
-                const float boostY = ((normVelY * actualBoost) / 17.0f) * FinalBoostMultiplier;
-                const float boostZ = ((normVelZ * actualBoost) / 17.0f) * FinalBoostMultiplier;
-
-                K4MemPatcher::writeMemory<float>(playerVehicleXAxisSpeed, velX + boostX);
-                K4MemPatcher::writeMemory<float>(playerVehicleYAxisSpeed, velY + boostY);
-                K4MemPatcher::writeMemory<float>(playerVehicleZAxisSpeed, velZ + boostZ);
-            }
-        }
-
-        Sleep(delayTimeMs);
-    }
-}
-
-// Read INI, configure everything, start DraftingSystemThread()
+// Read INI, configure everything, start DraftingSystemHook()
 void Setup() {
-    K4IniReader iniReader("NFSMWSlingshotFeatureConfig.ini");
+	const K4IniReader iniReader{ "NFSMWSlingshotFeatureConfig.ini" };
 
-    // Main
-    {
-        Enable = iniReader.read<bool>("Main", "Enable", false);
+	if (!iniReader) {
+		MessageBoxA(
+			nullptr,
+			"Couldn't open the configuration file for reading.\n"
+			"Verify the file exists in the directory the .asi is in.\n\n"
+			"File not found: \"NFSMWSlingshotFeatureConfig.ini\".",
+			"NFSMW Slingshot Feature by Kevin4e",
+			MB_ICONERROR
+		);
 
-        if (!Enable)
-            return;
-    }
+		return;
+	}
 
-    // Slingshot attributes
-    {
-        SlingshotMode = iniReader.read<int>("SlingshotAttributes", "SlingshotMode", 0);
+	// Main
+	{
+		Enable = iniReader.read<bool>("Main", "Enable", false);
 
-        if (SlingshotMode != 0 && SlingshotMode != 1)
-            return;
+		if (!Enable)
+			return; // Disable script
+	}
 
-        MaxSlingshotBoost = iniReader.read<float>("SlingshotAttributes", "MaxSlingshotBoost", 1.0f);
-        ProgressiveBoostMultiplier = iniReader.read<float>("SlingshotAttributes", "ProgressiveBoostMultiplier", 1.0f);
-        FinalBoostMultiplier = iniReader.read<float>("SlingshotAttributes", "FinalBoostMultiplier", 1.0f);
-    }
+	// Slingshot attributes
+	{
+		SlingshotMode = iniReader.read<int>("SlingshotAttributes", "SlingshotMode", 0);
 
-    // Boost ranges
-    {
-        MaxLongitudinalDistance = iniReader.read<float>("BoostRanges", "MaxLongitudinalDistance", 35.0f);
-        MaxLateralDistance = iniReader.read<float>("BoostRanges", "MaxLateralDistance", 1.5f);
-    }
+		if (SlingshotMode != 0 && SlingshotMode != 1)
+			return; // Invalid slingshot mode
 
-    // Debug
-    {
-        UseSpeedbreakerBarAsSlingshotMeter = iniReader.read<bool>("Debug", "UseSpeedbreakerBarAsSlingshotMeter", false);
+		MaxSlingshotBoost = iniReader.read<float>("SlingshotAttributes", "MaxSlingshotBoost", 1.0f);
+		ProgressiveBoostMultiplier = iniReader.read<float>("SlingshotAttributes", "ProgressiveBoostMultiplier", 1.0f);
+		FinalBoostMultiplier = iniReader.read<float>("SlingshotAttributes", "FinalBoostMultiplier", 1.0f);
+		DecayBoostMultiplier = iniReader.read<float>("SlingshotAttributes", "DecayBoostMultiplier", 1.0f);
+		MinimumSpeedForMaxDraftGainStr = iniReader.read<std::string>("SlingshotAttributes", "MinimumSpeedForMaxDraftGain", "300.0");
+	}
 
-        /*
-         *  NOPping out the writes at the speedbreaker causes flickering wheels
-         *
-        if (UseSpeedbreakerBarAsSlingshotMeter) {
-            // Cancel out every write made at the speedbreaker
-            K4MemPatcher::makeNOP(0x6EDE03, 6);
-            K4MemPatcher::makeNOP(0x6F8F9F, 3);
-            K4MemPatcher::makeNOP(0x6E9B36, 3);
-        }
-         */
-    }
+	// Boost ranges
+	{
+		MaxLongitudinalDistance = iniReader.read<float>("BoostRanges", "MaxLongitudinalDistance", 45.0f);
+		MaxLateralDistanceStr = iniReader.read<std::string>("BoostRanges", "MaxLateralDistance", "AUTO");
+		MaxVerticalDistanceStr = iniReader.read<std::string>("BoostRanges", "MaxVerticalDistance", "AUTO");
+	}
 
-    std::thread(DraftingSystemThread).detach();
+	// Debug
+	{
+		UseSpeedbreakerBarAsSlingshotMeter = iniReader.read<bool>("Debug", "UseSpeedbreakerBarAsSlingshotMeter", false);
+	}
+
+	speedDependency = MinimumSpeedForMaxDraftGainStr != "OFF";
+
+	if (speedDependency) MinimumSpeedForMaxDraftGain = iniReader.read<float>("SlingshotAttributes", "MinimumSpeedForMaxDraftGain", 300.0f);
+
+	autoLateral = MaxLateralDistanceStr == "AUTO";
+	autoVertical = MaxVerticalDistanceStr == "AUTO";
+
+	if (!autoLateral) MaxLateralDistance = iniReader.read<float>("BoostRanges", "MaxLateralDistance", 1.5f);
+	if (!autoVertical) MaxVerticalDistance = iniReader.read<float>("BoostRanges", "MaxVerticalDistance", 0.5f);
+
+	// Hook into the game's execution flow
+	K4MemPatcher::makeCALL(Game::PerFrameUpdate, DraftingSystemHook, false);
 }
 
+// ASI entry point (called by the ASI loader)
 extern "C" __declspec(dllexport) void InitializeASI() {
-    Setup();
+	Setup();
 }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) {
-    // Check if .exe file is compatible - Thanks to thelink2012 and MWisBest
-    // A few tweaks and simplified condition for clarity; logic unchanged, there were a few redundant operations
+// DLL entry point
+BOOL WINAPI DllMain(HINSTANCE, DWORD ul_reason_for_call, LPVOID)
+{
+	if (ul_reason_for_call == DLL_PROCESS_ATTACH) // If the DLL is being loaded
+	{
+		if (!NFSVersionManager::is(MostWanted)) // If the DLL has not been injected into Most Wanted v1.3
+		{
+			MessageBoxA(
+				nullptr,
+				"This .exe is potentially incompatible.\n"
+				"Use Most Wanted v1.3 executable for reliable use.",
+				"NFSMW Slingshot Feature by Kevin4e",
+				MB_ICONERROR
+			);
+			
+			return FALSE; // Detach DLL
+		}
+	}
 
-    IMAGE_NT_HEADERS* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(0x400108);
-
-    if (nt->OptionalHeader.AddressOfEntryPoint == 0x3C4040)
-        return TRUE;
-    else {
-        MessageBoxA(nullptr, "This .exe is not supported.\nPlease use v1.3 speed.exe (5.75 MB (6.029.312 bytes)).", "NFSMW Slingshot Feature by Kevin4e", MB_ICONERROR);
-        return FALSE;
-    }
+	return TRUE; // Keep DLL attached
 }
