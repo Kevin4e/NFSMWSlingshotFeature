@@ -1,5 +1,7 @@
 # NFSMW Slingshot Feature
 
+<img width="11811" height="6992" alt="nfsmw030 - Copia" src="https://github.com/user-attachments/assets/27cd98d2-e873-452f-9474-442278004668" />
+
 ## Installation
 1. Download the latest version of the [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader).
 2. Copy or move `dinput8.dll` to the root folder of the game.
