@@ -41,7 +41,7 @@ float slingshotBoost{};
 
 K4MemPatcher::StablePtr ptrToSpeedbreaker{ { 0x589228, 0x84 }, true };
 
-std::vector<VehicleInfo> activeAIVehicles{};
+std::vector<AIVehicle> activeAIVehicles{};
 
 /*
  *  Drafting system update routine.
@@ -71,7 +71,7 @@ void DraftingSystemHook() {
 	if (!openWorldFlag)
 		return; // Not in open world
 
-	const VehicleInfo playerVehicle{ getPlayerVehicle() };
+	const PlayerVehicle playerVehicle{ getPlayerVehicle() };
 
 	const float playerSpeed{ playerVehicle.currentSpeed };
 
@@ -91,6 +91,11 @@ void DraftingSystemHook() {
 	if (pauseMenuFlag)
 		return; // In pause menu
 
+	const bool momentCameraFlag{ K4MemPatcher::readMemory<bool>(Game::Flags::MomentCamera, false) };
+
+	if (momentCameraFlag)
+		return; // Moment camera is on
+
 	if (UseSpeedbreakerBarAsSlingshotMeter)
 		K4MemPatcher::writeMemory<float>(ptrToSpeedbreaker.Resolve(), slingshotBoost, false, false);
 
@@ -101,12 +106,7 @@ void DraftingSystemHook() {
 
 	const Size3 playerHalfDim{ playerVehicle.dim * 0.5f };
 
-	const Vec3 playerVelocities
-	{
-		K4MemPatcher::readMemory<float>(Player::Velocity::X, false),
-		K4MemPatcher::readMemory<float>(Player::Velocity::Y, false),
-		K4MemPatcher::readMemory<float>(Player::Velocity::Z, false)
-	};
+	const Vec3& playerVelocities{ playerVehicle.velocities };
 
 	const Vec3 playerNormVelocities{ playerVelocities / playerSpeed };
 
@@ -211,9 +211,14 @@ void DraftingSystemHook() {
 			const float boostY{ (playerNormVelocities.y * actualBoost) * FinalBoostMultiplier };
 			const float boostZ{ (playerNormVelocities.z * actualBoost) * FinalBoostMultiplier };
 
-			K4MemPatcher::writeMemory<float>(Player::Velocity::X, playerVelocities.x + boostX, false, false);
-			K4MemPatcher::writeMemory<float>(Player::Velocity::Y, playerVelocities.y + boostY, false, false);
-			K4MemPatcher::writeMemory<float>(Player::Velocity::Z, playerVelocities.z + boostZ, false, false);
+			const Vec3 finalVelocities
+			{
+				playerVelocities.x + boostX,
+				playerVelocities.y + boostY,
+				playerVelocities.z + boostZ
+			};
+			
+			setVelocities(finalVelocities);
 		}
 	}
 }

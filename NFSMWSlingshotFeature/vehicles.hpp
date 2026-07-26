@@ -7,8 +7,8 @@
 
 #include "../includes/nya-common-nfsmw-main/nfsmw.h"
 
-// Extracts position, dimension, forward vector and current speed from an active vehicle.
-inline VehicleInfo getIVehicleInfo(IVehicle* const IVehicle) noexcept {
+// Extracts position, dimension, forward, right, up vectors and current speed from an active vehicle.
+inline AIVehicle getIVehicleInfo(IVehicle* const IVehicle) noexcept {
 	IRigidBody* const rigidBody{ IVehicle->GetSimable()->GetRigidBody() };
 
 	const UMath::Vector3 pos{ *(rigidBody->GetPosition()) };
@@ -39,12 +39,37 @@ inline VehicleInfo getIVehicleInfo(IVehicle* const IVehicle) noexcept {
 }
 
 // Returns the player's vehicle info.
-inline VehicleInfo getPlayerVehicle() noexcept {
-	return getIVehicleInfo(VEHICLE_LIST::GetList(VEHICLE_PLAYERS).mBegin[0]); // Get the first player vehicle
+inline PlayerVehicle getPlayerVehicle() noexcept {
+	IVehicle* const playerIVehicle{ VEHICLE_LIST::GetList(VEHICLE_PLAYERS).mBegin[0] }; // Get the first player vehicle
+
+	const AIVehicle vehicle{ getIVehicleInfo(playerIVehicle) }; 
+
+	const UMath::Vector3 velocities{ *(playerIVehicle->GetSimable()->GetRigidBody()->GetLinearVelocity()) };
+
+	return
+	{
+		vehicle.pos,
+		vehicle.dim,
+		vehicle.forwardVector,
+		vehicle.rightVector,
+		vehicle.upVector,
+		vehicle.currentSpeed,
+		velocities.x,
+		velocities.y,
+		velocities.z
+	};
+}
+
+inline void setVelocities(const Vec3& velocities) noexcept {
+	IVehicle* const playerIVehicle{ VEHICLE_LIST::GetList(VEHICLE_PLAYERS).mBegin[0] };
+
+	const UMath::Vector3 vel{ velocities.x, velocities.y, velocities.z };
+
+	playerIVehicle->GetSimable()->GetRigidBody()->SetLinearVelocity(&vel);
 }
 
 // Collects all active AI vehicles in the game and extracts their info.
-inline void getActiveAIVehicles(std::vector<VehicleInfo>& outList) {
+inline void getActiveAIVehicles(std::vector<AIVehicle>& outList) {
 	outList.clear();
 
 	const auto& vehicleListStruct{ VEHICLE_LIST::GetList(VEHICLE_AI) }; // Metadata about vehicle list

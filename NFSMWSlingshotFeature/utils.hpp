@@ -50,15 +50,19 @@ struct Size3 {
 	}
 };
 
-struct VehicleInfo {
+struct AIVehicle {
 	const Vec3 pos{};
 	const Size3 dim{};
 	const Vec3 forwardVector{ 0.0f, 0.0f, 1.0f };
 	const Vec3 rightVector{ 1.0f, 0.0f, 0.0f };
 	const Vec3 upVector{ 0.0f, 1.0f, 0.0f };
 	const float currentSpeed{};
+};
 
-	Vec3 relativePositionTo(const VehicleInfo& vi) const noexcept {
+struct PlayerVehicle : AIVehicle {
+	const Vec3 velocities{};
+
+	Vec3 relativePositionTo(const AIVehicle& vi) const noexcept {
 		const Vec3 delta{ vi.pos - pos };
 
 		return
