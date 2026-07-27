@@ -1,6 +1,10 @@
 # NFSMW Slingshot Feature
 
-<img width="11811" height="6992" alt="nfsmw030 - Copia" src="https://github.com/user-attachments/assets/27cd98d2-e873-452f-9474-442278004668" />
+![Thumbnail](assets/thumbnail.png)
+
+## Showcase
+[![Video Showcase](https://img.youtube.com/vi/E-O1lZbWqLg/maxresdefault.jpg)](https://www.youtube.com/watch?v=E-O1lZbWqLg)
+In this video `UseSpeedbreakerBarAsSlingshotMeter` is enabled.
 
 ## Installation
 1. Download the latest version of the [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader).
