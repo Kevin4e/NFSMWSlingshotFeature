@@ -2,7 +2,7 @@
 
 ![Thumbnail](assets/thumbnail.png)
 
-## Showcase
+## Video Showcase (YouTube)
 [![Video Showcase](https://img.youtube.com/vi/E-O1lZbWqLg/maxresdefault.jpg)](https://www.youtube.com/watch?v=E-O1lZbWqLg)
 In this video `UseSpeedbreakerBarAsSlingshotMeter` is enabled.
 
