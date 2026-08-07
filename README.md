@@ -18,9 +18,8 @@ There's also a **leftover** which replaces the speedbreaker bar with the slingsh
   
 Configuration file: `NFSMWSlingshotFeatureConfig.ini`.
 
-## Permissions
-- You're **NOT** allowed to re-upload my mod anywhere else without my permission.
-- You can use my mod on your modpack **as long as** you ask me privately.
+## License
+- See [LICENSE](LICENSE)
 
 ## Credits
 - **[Kevin4e](https://github.com/Kevin4e)** - Author of the mod.
